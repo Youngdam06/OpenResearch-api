@@ -1,9 +1,8 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException, status
 import requests
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import re
 from collections import Counter
-from fastapi import HTTPException
 STOPWORDS = {
     "the","of","and","in","for","on","with","to","a","an","by","from","at","as",
     "is","are","be","this","that","using","use","based","via","into","between",
@@ -11,9 +10,48 @@ STOPWORDS = {
     "models","data","application","applications"
 }
 
+# ===== Standard Error Definitions (Numeric Codes) =====
 
+ERROR_INVALID_QUERY = {
+    "http_status": status.HTTP_422_UNPROCESSABLE_ENTITY,  # 422
+    "code": 422,
+    "message": "Invalid query parameter",
+    "description": "Required query parameter is missing or has invalid format."
+}
+
+ERROR_NOT_FOUND = {
+    "http_status": status.HTTP_404_NOT_FOUND,  # 404
+    "code": 404,
+    "message": "Resource not found",
+    "description": "The requested paper or resource could not be found."
+}
+
+ERROR_UPSTREAM_FAILED = {
+    "http_status": status.HTTP_502_BAD_GATEWAY,  # 502
+    "code": 502,
+    "message": "Upstream provider error",
+    "description": "Failed to fetch data from OpenAlex or Crossref."
+}
+
+ERROR_INTERNAL = {
+    "http_status": status.HTTP_500_INTERNAL_SERVER_ERROR,  # 500
+    "code": 500,
+    "message": "Internal server error",
+    "description": "An unexpected error occurred on the server."
+}
 
 app = FastAPI(title="Research Metadata API", version="1.0.0")
+
+# --------- Helpers: Errors Handler -----------
+def raise_api_error(error_def: dict, details: dict | None = None):
+    payload = {
+        "status": "error",
+        "code": error_def["code"],
+        "message": error_def["message"],
+        "description": error_def["description"],
+        "details": details,
+    }
+    raise HTTPException(status_code=error_def["http_status"], detail=payload)
 
 # --------- Helpers: Lookup paper by doi -----------
 def fetch_openalex_by_doi(doi: str):
@@ -320,27 +358,26 @@ def search(
     to_year: int | None = Query(None, description="To publication year"),
     limit: int = Query(20, ge=1, le=50, description="Max results"),
 ):
+    if not query or not query.strip():
+        raise_api_error(ERROR_INVALID_QUERY, details={"param": "query"})
+
     results = []
 
     per_source_limit = max(1, limit // 2)
 
-    # Fetch from OpenAlex
     try:
         oa_results = fetch_openalex(query, from_year, to_year, per_source_limit)
         results.extend(oa_results)
     except Exception as e:
-        print("OpenAlex error:", e)
+        raise_api_error(ERROR_UPSTREAM_FAILED, details={"provider": "openalex", "error": str(e)})
 
-    # Fetch from CrossRef
     try:
         cr_results = fetch_crossref(query, from_year, to_year, per_source_limit)
         results.extend(cr_results)
     except Exception as e:
-        print("CrossRef error:", e)
+        raise_api_error(ERROR_UPSTREAM_FAILED, details={"provider": "crossref", "error": str(e)})
 
-    # Deduplicate by DOI
     results = deduplicate_by_doi(results)
-
     results = results[:limit]
 
     return {
@@ -353,6 +390,7 @@ def search(
         "results": results,
     }
 
+
 @app.get("/v1/trends")
 def trends(
     query: str = Query(...),
@@ -361,29 +399,34 @@ def trends(
     limit: int = Query(20, ge=1, le=50),
     top: int = Query(10, ge=1, le=50),
 ):
+    if not query or not query.strip():
+        raise_api_error(ERROR_INVALID_QUERY, details={"param": "query"})
+
     results = []
 
     try:
         oa_results = fetch_openalex(query, from_year, to_year, limit)
         results.extend(oa_results)
     except Exception as e:
-        print("OpenAlex error:", e)
+        raise_api_error(ERROR_UPSTREAM_FAILED, details={"provider": "openalex", "error": str(e)})
 
     try:
         cr_results = fetch_crossref(query, from_year, to_year, limit)
         results.extend(cr_results)
     except Exception as e:
-        print("CrossRef error:", e)
+        raise_api_error(ERROR_UPSTREAM_FAILED, details={"provider": "crossref", "error": str(e)})
 
     results = deduplicate_by_doi(results)
 
     titles = [r["title"] for r in results if r.get("title")]
 
-    unigram_trends = extract_keywords(titles, top=top)
-    bigram_trends = extract_bigrams(titles, top=top)
-    trigram_trends = extract_trigrams(titles, top=top)
-
-    yearly = trends_per_year(results, top=min(5, top))
+    try:
+        unigram_trends = extract_keywords(titles, top=top)
+        bigram_trends = extract_bigrams(titles, top=top)
+        trigram_trends = extract_trigrams(titles, top=top)
+        yearly = trends_per_year(results, top=min(5, top))
+    except Exception as e:
+        raise_api_error(ERROR_INTERNAL, details={"error": str(e)})
 
     return {
         "query": query,
@@ -399,14 +442,18 @@ def trends(
         "per_year": yearly
     }
 
+
+from requests.exceptions import HTTPError, RequestException
+
 @app.get("/v1/papers/lookup")
 def lookup_paper(
     doi: str = Query(..., description="DOI of the paper, e.g. 10.1000/xyz123")
 ):
-    # Normalisasi DOI (hapus https://doi.org/ kalau user masukin itu)
     doi_clean = doi.replace("https://doi.org/", "").strip()
 
-    # Coba dari OpenAlex dulu
+    not_found_count = 0
+
+    # Try OpenAlex
     try:
         result = fetch_openalex_by_doi(doi_clean)
         if result:
@@ -414,10 +461,35 @@ def lookup_paper(
                 "source": "openalex",
                 "paper": result
             }
-    except Exception as e:
-        print("OpenAlex lookup error:", e)
+        else:
+            not_found_count += 1
+    except HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            not_found_count += 1
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "status": "error",
+                    "code": 502,
+                    "message": "Upstream provider error",
+                    "description": "Failed to fetch data from OpenAlex.",
+                    "details": {"provider": "openalex", "error": str(e)}
+                }
+            )
+    except RequestException as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "status": "error",
+                "code": 502,
+                "message": "Upstream provider error",
+                "description": "Failed to fetch data from OpenAlex.",
+                "details": {"provider": "openalex", "error": str(e)}
+            }
+        )
 
-    # Kalau nggak ketemu / error, coba CrossRef
+    # Try CrossRef
     try:
         result = fetch_crossref_by_doi(doi_clean)
         if result:
@@ -425,8 +497,44 @@ def lookup_paper(
                 "source": "crossref",
                 "paper": result
             }
-    except Exception as e:
-        print("CrossRef lookup error:", e)
+        else:
+            not_found_count += 1
+    except HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            not_found_count += 1
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "status": "error",
+                    "code": 502,
+                    "message": "Upstream provider error",
+                    "description": "Failed to fetch data from Crossref.",
+                    "details": {"provider": "crossref", "error": str(e)}
+                }
+            )
+    except RequestException as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "status": "error",
+                "code": 502,
+                "message": "Upstream provider error",
+                "description": "Failed to fetch data from Crossref.",
+                "details": {"provider": "crossref", "error": str(e)}
+            }
+        )
 
-    # Kalau dua-duanya gagal
-    raise HTTPException(status_code=404, detail="Paper not found for given DOI")
+    # Kalau dua-duanya not found
+    if not_found_count >= 2:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "status": "error",
+                "code": 404,
+                "message": "Paper not found",
+                "description": "No paper was found for the given DOI in OpenAlex and Crossref.",
+                "details": {"doi": doi_clean}
+            }
+        )
+
