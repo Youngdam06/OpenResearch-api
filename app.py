@@ -1,8 +1,12 @@
 from fastapi import FastAPI, Query, HTTPException, status
 import requests
+import redis
+import json
+import hashlib
 from typing import List, Dict, Any, Optional
 import re
 from collections import Counter
+from requests.exceptions import HTTPError, RequestException
 STOPWORDS = {
     "the","of","and","in","for","on","with","to","a","an","by","from","at","as",
     "is","are","be","this","that","using","use","based","via","into","between",
@@ -42,6 +46,51 @@ ERROR_INTERNAL = {
 
 app = FastAPI(title="Research Metadata API", version="1.0.0")
 
+# ===== Redis Server (lokal)
+redis_client = redis.Redis(
+    host="localhost",
+    port=6379,
+    db=0,
+    decode_responses=True
+)
+
+# --------- Helpers: caching -----------
+def make_cache_key(prefix: str, params: dict) -> str:
+    raw = json.dumps(params, sort_keys=True)
+    digest = hashlib.md5(raw.encode()).hexdigest()
+    return f"{prefix}:{digest}"
+
+def get_cache(key: str):
+    try:
+        cached = redis_client.get(key)
+        if cached:
+            return json.loads(cached)
+    except Exception:
+        pass
+    return None
+
+def set_cache(key: str, value: dict, ttl: int):
+    try:
+        redis_client.setex(key, ttl, json.dumps(value))
+    except Exception:
+        pass
+
+def is_cacheable_response(response: dict) -> bool:
+    # jangan cache kalau kosong
+    if not response:
+        return False
+
+    # jangan cache error
+    if "detail" in response:
+        return False
+
+    # khusus search / trends → harus ada data
+    if "results" in response and len(response["results"]) == 0:
+        return False
+
+    return True
+
+
 # --------- Helpers: Errors Handler -----------
 def raise_api_error(error_def: dict, details: dict | None = None):
     payload = {
@@ -65,6 +114,10 @@ def fetch_openalex_by_doi(doi: str):
     }
 
     r = requests.get(url, params=params, headers=headers, timeout=15)
+
+    if r.status_code == 404:
+        return None
+    
     r.raise_for_status()
     data = r.json()
 
@@ -83,6 +136,10 @@ def fetch_crossref_by_doi(doi: str):
     }
 
     r = requests.get(url, headers=headers, timeout=15)
+
+    if r.status_code == 404:
+        return None
+    
     r.raise_for_status()
     data = r.json()
 
@@ -353,42 +410,60 @@ def health():
 
 @app.get("/v1/papers/search")
 def search(
-    query: str = Query(..., description="Search keyword / title"),
-    from_year: int | None = Query(None, description="From publication year"),
-    to_year: int | None = Query(None, description="To publication year"),
-    limit: int = Query(20, ge=1, le=50, description="Max results"),
+    query: str = Query(...),
+    from_year: int | None = Query(None),
+    to_year: int | None = Query(None),
+    limit: int = Query(20, ge=1, le=50),
 ):
-    if not query or not query.strip():
-        raise_api_error(ERROR_INVALID_QUERY, details={"param": "query"})
-
-    results = []
-
-    per_source_limit = max(1, limit // 2)
-
-    try:
-        oa_results = fetch_openalex(query, from_year, to_year, per_source_limit)
-        results.extend(oa_results)
-    except Exception as e:
-        raise_api_error(ERROR_UPSTREAM_FAILED, details={"provider": "openalex", "error": str(e)})
-
-    try:
-        cr_results = fetch_crossref(query, from_year, to_year, per_source_limit)
-        results.extend(cr_results)
-    except Exception as e:
-        raise_api_error(ERROR_UPSTREAM_FAILED, details={"provider": "crossref", "error": str(e)})
-
-    results = deduplicate_by_doi(results)
-    results = results[:limit]
-
-    return {
+    cache_key = make_cache_key("search", {
         "query": query,
-        "filters": {
-            "from_year": from_year,
-            "to_year": to_year,
-        },
-        "count": len(results),
-        "results": results,
-    }
+        "from_year": from_year,
+        "to_year": to_year,
+        "limit": limit
+    })
+
+    cached = get_cache(cache_key)
+    if cached:
+        return cached
+
+    try:
+        results = []
+        per_source_limit = max(1, limit // 2)
+
+        oa_results = fetch_openalex(query, from_year, to_year, per_source_limit)
+        cr_results = fetch_crossref(query, from_year, to_year, per_source_limit)
+
+        results.extend(oa_results)
+        results.extend(cr_results)
+
+        results = deduplicate_by_doi(results)[:limit]
+
+        response = {
+            "query": query,
+            "filters": {
+                "from_year": from_year,
+                "to_year": to_year,
+            },
+            "count": len(results),
+            "results": results,
+        }
+
+        if is_cacheable_response(response):
+            set_cache(cache_key, response, ttl=60 * 60 * 3)  # 3 jam
+
+        return response
+
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "status": "error",
+                "code": 502,
+                "message": "Upstream service error",
+                "description": "Failed to fetch data from OpenAlex or Crossref."
+            }
+        )
+
 
 
 @app.get("/v1/trends")
@@ -399,142 +474,104 @@ def trends(
     limit: int = Query(20, ge=1, le=50),
     top: int = Query(10, ge=1, le=50),
 ):
-    if not query or not query.strip():
-        raise_api_error(ERROR_INVALID_QUERY, details={"param": "query"})
-
-    results = []
-
-    try:
-        oa_results = fetch_openalex(query, from_year, to_year, limit)
-        results.extend(oa_results)
-    except Exception as e:
-        raise_api_error(ERROR_UPSTREAM_FAILED, details={"provider": "openalex", "error": str(e)})
-
-    try:
-        cr_results = fetch_crossref(query, from_year, to_year, limit)
-        results.extend(cr_results)
-    except Exception as e:
-        raise_api_error(ERROR_UPSTREAM_FAILED, details={"provider": "crossref", "error": str(e)})
-
-    results = deduplicate_by_doi(results)
-
-    titles = [r["title"] for r in results if r.get("title")]
-
-    try:
-        unigram_trends = extract_keywords(titles, top=top)
-        bigram_trends = extract_bigrams(titles, top=top)
-        trigram_trends = extract_trigrams(titles, top=top)
-        yearly = trends_per_year(results, top=min(5, top))
-    except Exception as e:
-        raise_api_error(ERROR_INTERNAL, details={"error": str(e)})
-
-    return {
+    cache_key = make_cache_key("trends", {
         "query": query,
-        "filters": {
-            "from_year": from_year,
-            "to_year": to_year,
-        },
-        "total_papers": len(results),
-        "top": top,
-        "unigrams": unigram_trends,
-        "bigrams": bigram_trends,
-        "trigrams": trigram_trends,
-        "per_year": yearly
-    }
+        "from_year": from_year,
+        "to_year": to_year,
+        "limit": limit,
+        "top": top
+    })
 
+    cached = get_cache(cache_key)
+    if cached:
+        return cached
 
-from requests.exceptions import HTTPError, RequestException
+    try:
+        results = []
+        results.extend(fetch_openalex(query, from_year, to_year, limit))
+        results.extend(fetch_crossref(query, from_year, to_year, limit))
+
+        results = deduplicate_by_doi(results)
+        titles = [r["title"] for r in results if r.get("title")]
+
+        response = {
+            "query": query,
+            "filters": {
+                "from_year": from_year,
+                "to_year": to_year,
+            },
+            "total_papers": len(results),
+            "top": top,
+            "unigrams": extract_keywords(titles, top),
+            "bigrams": extract_bigrams(titles, top),
+            "trigrams": extract_trigrams(titles, top),
+            "per_year": trends_per_year(results, top=min(5, top)),
+        }
+
+        if is_cacheable_response(response):
+            set_cache(cache_key, response, ttl=60 * 60 * 6)  # 6 jam
+
+        return response
+
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "status": "error",
+                "code": 502,
+                "message": "Upstream service error",
+                "description": "Failed to fetch trend data from OpenAlex or Crossref."
+            }
+        )
 
 @app.get("/v1/papers/lookup")
 def lookup_paper(
-    doi: str = Query(..., description="DOI of the paper, e.g. 10.1000/xyz123")
+    doi: str = Query(...)
 ):
     doi_clean = doi.replace("https://doi.org/", "").strip()
 
-    not_found_count = 0
+    cache_key = make_cache_key("lookup", {"doi": doi_clean})
+    cached = get_cache(cache_key)
 
-    # Try OpenAlex
+    if cached:
+        return cached
+
     try:
         result = fetch_openalex_by_doi(doi_clean)
-        if result:
-            return {
-                "source": "openalex",
-                "paper": result
-            }
-        else:
-            not_found_count += 1
-    except HTTPError as e:
-        if e.response is not None and e.response.status_code == 404:
-            not_found_count += 1
-        else:
+        if not result:
+            result = fetch_crossref_by_doi(doi_clean)
+
+        if not result:
             raise HTTPException(
-                status_code=502,
+                status_code=404,
                 detail={
                     "status": "error",
-                    "code": 502,
-                    "message": "Upstream provider error",
-                    "description": "Failed to fetch data from OpenAlex.",
-                    "details": {"provider": "openalex", "error": str(e)}
+                    "code": 404,
+                    "message": "Paper not found",
+                    "description": "No paper was found for the given DOI in OpenAlex and Crossref.",
+                    "details": {"doi": doi_clean}
                 }
             )
-    except RequestException as e:
+
+        response = {
+            "paper": result
+        }
+
+        set_cache(cache_key, response, ttl=60 * 60 * 24)  # 24 jam
+
+        return response
+
+    except HTTPException:
+        raise
+    except Exception:
         raise HTTPException(
             status_code=502,
             detail={
                 "status": "error",
                 "code": 502,
-                "message": "Upstream provider error",
-                "description": "Failed to fetch data from OpenAlex.",
-                "details": {"provider": "openalex", "error": str(e)}
+                "message": "Upstream service error",
+                "description": "Failed to fetch paper metadata."
             }
         )
 
-    # Try CrossRef
-    try:
-        result = fetch_crossref_by_doi(doi_clean)
-        if result:
-            return {
-                "source": "crossref",
-                "paper": result
-            }
-        else:
-            not_found_count += 1
-    except HTTPError as e:
-        if e.response is not None and e.response.status_code == 404:
-            not_found_count += 1
-        else:
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "status": "error",
-                    "code": 502,
-                    "message": "Upstream provider error",
-                    "description": "Failed to fetch data from Crossref.",
-                    "details": {"provider": "crossref", "error": str(e)}
-                }
-            )
-    except RequestException as e:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "status": "error",
-                "code": 502,
-                "message": "Upstream provider error",
-                "description": "Failed to fetch data from Crossref.",
-                "details": {"provider": "crossref", "error": str(e)}
-            }
-        )
-
-    # Kalau dua-duanya not found
-    if not_found_count >= 2:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "status": "error",
-                "code": 404,
-                "message": "Paper not found",
-                "description": "No paper was found for the given DOI in OpenAlex and Crossref.",
-                "details": {"doi": doi_clean}
-            }
-        )
 
