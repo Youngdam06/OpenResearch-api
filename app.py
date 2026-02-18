@@ -3,6 +3,7 @@ import requests
 import redis
 import json
 import hashlib
+import os
 from typing import List, Dict, Any, Optional
 import re
 from collections import Counter
@@ -46,14 +47,16 @@ ERROR_INTERNAL = {
 
 app = FastAPI(title="Research Metadata API", version="1.0.0")
 
-# ===== Redis Server (lokal)
+# ===== Redis Server 
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+
 redis_client = redis.Redis(
-    host="localhost",
-    port=6379,
+    host=REDIS_HOST,
+    port=REDIS_PORT,
     db=0,
     decode_responses=True
 )
-
 # --------- Helpers: caching -----------
 def make_cache_key(prefix: str, params: dict) -> str:
     raw = json.dumps(params, sort_keys=True)
