@@ -153,7 +153,7 @@ If the API works well for your project or production needs, you can easily upgra
 }
 ```
 
-💳 Subscription Plans
+### 💳 Subscription Plans
 
 OpenResearch API is available through RapidAPI subscription plans.
 
@@ -179,7 +179,7 @@ All plans include:
 
 You can manage or upgrade your plan anytime from the RapidAPI dashboard.
 
-### Use Cases
+### 🧠 Use Cases
 - 🧠 AI builders doing data enrichment.
 
 - 📚 Research tools and academic platforms.
