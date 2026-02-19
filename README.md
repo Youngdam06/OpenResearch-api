@@ -31,7 +31,7 @@ curl --request GET \
 ```
 To try this API, you can start with the Free plan on RapidAPI.
 
-1. Open the OpenResearch API page on RapidAPI (link page below).
+1. Open the OpenResearch API page on RapidAPI (link page are above & below).
 
 2. Subscribe using the Free plan (no payment needed).
 
